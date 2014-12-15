@@ -1,9 +1,11 @@
+// Package SPI implements SPI protocol (http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus)
+// using bit banging (http://en.wikipedia.org/wiki/Bit_banging).
 package spi
 
 import "io"
 
-// Mode describes relation between bit read/write and clock value/edge and what bit
-// from byte need to be transmitted first..
+// Mode describes relation between bit read/write and clock value/edge and what
+// bit from a byte need to be transmitted first.
 type Mode int
 
 const (
@@ -15,23 +17,28 @@ const (
 	CPHA1 Mode = 4 // Sample on second edge.
 )
 
-// Config contains configuration of SPI mster. There can be many types of
-// slave devices connected to the SPI bus. Any device may require specific
-// master configuration to communicate properly.
+// Config contains configuration of SPI mster. There can be many types of slave
+// devices connected to the SPI bus. Any device may require specific master
+// configuration to communicate properly.
 type Config struct {
 	Mode     Mode
 	FrameLen int // Number of bits in frame.
 	Delay    int // Delay between frames (t = Delay * 4 * clock_period).
 }
 
-// SPI implements Serial Peripheral Interface protocol on master side
-// (see: http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus).
+// SPI implements Serial Peripheral Interface protocol on master side.
 type SPI struct {
-	rw         io.ReadWriter
-	cfg        Config
-	n          int
-	mosi, miso byte
-	obuf       [17]byte
+	rw   io.ReadWriter
+	n    int
+	sclk byte
+	mosi byte
+	miso byte
+
+	// From Config.
+	cidle  byte
+	cfirst byte
+	lsbf   bool
+	flen   int
 }
 
 // New returns new SPI that uses rw to read/write data using SPI protocol.
@@ -53,83 +60,85 @@ func (spi *SPI) Init(rw io.ReadWriter, sclk, mosi, miso byte) {
 		panic("scln&mosi != 0")
 	}
 	spi.rw = rw
-	spi.cfg = Config{FrameLen: 8}
 	spi.n = 0
+	spi.sclk = sclk
 	spi.mosi = mosi
 	spi.miso = miso
-	for i := 1; i < len(spi.obuf); i += 2 {
-		spi.obuf[i] = sclk
-	}
+	spi.flen = 8
 }
 
-// Configure configures SPI master. It can be used before every conversation
-// to specific slave device.
+// Configure configures SPI master. It can be used before start conversation to
+// slave device.
 func (spi *SPI) Configure(cfg Config) {
-	spi.cfg = cfg
+	if cfg.Mode&CPHA1 == 0 {
+		spi.cidle = 0
+		if cfg.Mode&CPOL1 == 0 {
+			spi.cfirst = 0
+		} else {
+			spi.cfirst = spi.sclk
+		}
+	} else {
+		spi.cidle = spi.sclk
+		if cfg.Mode&CPOL1 == 0 {
+			spi.cfirst = spi.sclk
+		} else {
+			spi.cfirst = 0
+		}
+	}
+	spi.lsbf = (cfg.Mode&LSBF != 0)
 }
 
-// NewFrame resets internal bit counter. Use it to ensure that subsequent
-// Write starts new frame. Additionaly it ensures that subsequent Write call
-// doesn't start with delay clock sequence. Use it to avoid delay when
-// it isn't need.
+// Idle sets SCLK line in idle state. It should be called before starting
+// conversation (for CPHA1) or after ended conversation (for CPHA0).
+func (spi *SPI) Idle() error {
+	_, err := spi.rw.Write([]byte{spi.cidle})
+	return err
+}
+
+// NewFrame resets internal bit counter. Use it to ensure that subsequent Write
+// starts new frame (not need if last frame has been completly written).
+// Additionaly it ensures that subsequent Write call doesn't start with delay
+// clock sequence. Use it to avoid produce delay bits if they aren't needed.
 func (spi *SPI) NewFrame() {
 	spi.n = 0
 }
 
 // Write
 // Write requires that SCLK line is in proper idle state.
-func (spi *SPI) Write(data []byte) (n int, err error) {
-	if n = 16 {
-		
-	}
-	if n == 0 {
-		// New word begins.
-		
-	}
-
-	var m int
-	if spi.mode&CPHA1 != 0 {
-
-		m, err = spi.rw.Write(spi.base)
-		n += m
-		if err != nil {
-			return
-		}
-	}
-	var (
-		mask  uint
-		shift func(uint) uint
-	)
-	if spi.mode&LSBF == 0 {
-		mask = 0x01
-		shift = func(m uint) uint { return m << 1 }
-	} else {
-		mask = 0x80
-		shift = func(m uint) uint { return m >> 1 }
-	}
-	for b := range data {
-		for i := 0; i < 16; i += 2 {
-			if uint(b)&mask == 0 {
-				spi.obuf[i] &^= spi.mosi
-				spi.obuf[i+1] &^= spi.mosi
-			} else {
-				spi.obuf[i] |= spi.mosi
-				spi.obuf[i+1] |= spi.mosi
+func (spi *SPI) Write(data []byte) (int, error) {
+	var obuf [16]byte
+	if spi.lsbf {
+		for n, b := range data {
+			mask := uint(0x01)
+			for i := 0; i < 16; i += 2 {
+				out := spi.cfirst
+				if mask&uint(b) != 0 {
+					out = spi.cfirst | spi.mosi
+				}
+				obuf[i] = out
+				obuf[i+1] = out ^ spi.sclk
+				mask <<= 1
 			}
-			mask = shift(mask)
+			if _, err := spi.rw.Write(obuf[:]); err != nil {
+				return n, err
+			}
 		}
-		m, err = spi.rw.Write(spi.obuf[:])
-		n += m
-		if err != nil {
-			return
+	} else {
+		for n, b := range data {
+			mask := uint(0x80)
+			for i := 0; i < 16; i += 2 {
+				out := spi.cfirst
+				if mask&uint(b) != 0 {
+					out = spi.cfirst | spi.mosi
+				}
+				obuf[i] = out
+				obuf[i+1] = out ^ spi.sclk
+				mask >>= 1
+			}
+			if _, err := spi.rw.Write(obuf[:]); err != nil {
+				return n, err
+			}
 		}
 	}
-	if spi.mode&CPHA1 == 0 {
-		m, err = spi.rw.Write(spi.base)
-		n += m
-		if err != nil {
-			return
-		}
-	}
-	return
+	return len(data), nil
 }
