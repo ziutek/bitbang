@@ -2,6 +2,7 @@ package bitbang
 
 import (
 	"io"
+	"strconv"
 )
 
 type Debug struct {
@@ -13,11 +14,12 @@ func NewDebug(w io.Writer) Debug {
 }
 
 func (d Debug) Write(data []byte) (int, error) {
-	var out [16]byte
+	var out [19]byte
 	for i := 1; i < 15; i += 2 {
 		out[i] = '\t'
 	}
-	out[15] = '\n'
+	out[15] = '\t'
+	out[18] = '\n'
 
 	for n, b := range data {
 		mask := uint(0x80)
@@ -29,16 +31,15 @@ func (d Debug) Write(data []byte) (int, error) {
 			}
 			mask >>= 1
 		}
+		out[17] = 0
+		strconv.AppendUint(out[16:16:18], uint64(b), 16)
+		if out[17] == 0 {
+			out[17] = out[16]
+			out[16] = '0'
+		}
 		if _, err := d.w.Write(out[:]); err != nil {
 			return n, err
 		}
-	}
-	return len(data), nil
-}
-
-func (_ Debug) Read(data []byte) (int, error) {
-	for i := range data {
-		data[i] = 0
 	}
 	return len(data), nil
 }
