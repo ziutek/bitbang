@@ -19,6 +19,28 @@ const (
 	CPHA1 Mode = 4 // Sample on second edge.
 )
 
+func (m Mode) String() string {
+	switch m {
+	case MSBF | CPOL0 | CPHA0:
+		return "M00"
+	case MSBF | CPOL0 | CPHA1:
+		return "M01"
+	case MSBF | CPOL1 | CPHA0:
+		return "M10"
+	case MSBF | CPOL1 | CPHA1:
+		return "M11"
+	case LSBF | CPOL0 | CPHA0:
+		return "L00"
+	case LSBF | CPOL0 | CPHA1:
+		return "L01"
+	case LSBF | CPOL1 | CPHA0:
+		return "L10"
+	case LSBF | CPOL1 | CPHA1:
+		return "L11"
+	}
+	return "unknown"
+}
+
 // Config contains configuration of SPI mster. There can be many types of slave
 // devices connected to the SPI bus simultaneously. Any device may require
 // specific master configuration to communicate properly.
