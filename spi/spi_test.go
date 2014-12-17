@@ -27,7 +27,7 @@ func (wt *wtest) check(t *testing.T) {
 
 var wts = []wtest{
 	{
-		cfg: Config{MSBF | CPOL0 | CPHA0, 0, 0},
+		cfg: Config{MSBF | CPOL0 | CPHA0, 1, 0},
 		in:  []byte{0x55, 0xaa},
 		out: []byte{
 			0x00, 0x01, 0x10, 0x11, 0x00, 0x01, 0x10, 0x11,
@@ -40,7 +40,7 @@ var wts = []wtest{
 		},
 	},
 	{
-		cfg: Config{MSBF | CPOL1 | CPHA1, 0, 0},
+		cfg: Config{MSBF | CPOL1 | CPHA1, 1, 0},
 		in:  []byte{0x55, 0xaa},
 		out: []byte{
 			0x01,
@@ -53,7 +53,7 @@ var wts = []wtest{
 		},
 	},
 	{
-		cfg: Config{LSBF | CPOL0 | CPHA0, 0, 0},
+		cfg: Config{LSBF | CPOL0 | CPHA0, 1, 0},
 		in:  []byte{0xf0, 0x0f},
 		out: []byte{
 			0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
@@ -66,7 +66,7 @@ var wts = []wtest{
 		},
 	},
 	{
-		cfg: Config{LSBF | CPOL1 | CPHA0, 0, 0},
+		cfg: Config{LSBF | CPOL1 | CPHA0, 1, 0},
 		in:  []byte{0xf0, 0x0f},
 		out: []byte{
 			0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
@@ -79,7 +79,7 @@ var wts = []wtest{
 		},
 	},
 	{
-		cfg: Config{LSBF | CPOL0 | CPHA1, 0, 0},
+		cfg: Config{LSBF | CPOL0 | CPHA1, 1, 0},
 		in:  []byte{0xf0, 0x0f},
 		out: []byte{
 			0x00,
@@ -92,7 +92,7 @@ var wts = []wtest{
 		},
 	},
 	{
-		cfg: Config{LSBF | CPOL1 | CPHA1, 0, 0},
+		cfg: Config{LSBF | CPOL1 | CPHA1, 1, 0},
 		in:  []byte{0xf0, 0x0f},
 		out: []byte{
 			0x01,

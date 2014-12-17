@@ -3,7 +3,7 @@
 package spi
 
 import (
-	"io"
+	"github.com/ziutek/bitbang"
 )
 
 // Mode describes relation between bit read/write and clock value/edge and what
@@ -46,15 +46,15 @@ func (m Mode) String() string {
 // specific master configuration to communicate properly.
 type Config struct {
 	Mode     Mode
-	FrameLen int // Number of bytes in frame (only used if Delay!=0).
+	FrameLen int // Number of bytes in frame.
 	Delay    int // Delay between frames (delayTime = Delay*clockPeriod).
 }
 
 // SPI implements Serial Peripheral Interface protocol on master side.
 type SPI struct {
-	r    io.Reader
-	w    io.Writer
-	bif  int
+	drv  bitbang.SyncDriver
+	rbif int
+	wbif int
 	sclk byte
 	mosi byte
 	miso byte
@@ -75,20 +75,20 @@ type SPI struct {
 // New panics if sclk&mosi != 0. Default configuration is: MSBF, CPOL0,
 // CPHA0, 8bit, no delay.
 // TODO: Write about sampling rate.
-func New(r io.Reader, w io.Writer, sclk, mosi, miso byte) *SPI {
+func New(drv bitbang.SyncDriver, sclk, mosi, miso byte) *SPI {
 	spi := new(SPI)
-	spi.Init(r, w, sclk, mosi, miso)
+	spi.Init(drv, sclk, mosi, miso)
 	return spi
 }
 
 // Init works like New but initializes existing SPI variable.
-func (spi *SPI) Init(r io.Reader, w io.Writer, sclk, mosi, miso byte) {
+func (spi *SPI) Init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
 	if sclk&mosi != 0 {
 		panic("SPI.Init: scln&mosi != 0")
 	}
-	spi.r = r
-	spi.w = w
-	spi.bif = 0
+	spi.drv = drv
+	spi.rbif = 0
+	spi.wbif = 0
 	spi.sclk = sclk
 	spi.mosi = mosi
 	spi.miso = miso
@@ -124,14 +124,22 @@ func (spi *SPI) Configure(cfg Config) {
 	spi.delay = cfg.Delay
 }
 
-// Begin should be called before starting conversation with slave device.
-// If ss!=nil Begin calls ss(true) just before return, to select slave device.
+// Begin should be called before starting conversation with slave device. It
+// calls drivers PurgeReadBuffer method and in case of CPHA1 it sets SCLK line
+// to its idle state.  If no erros and ss!=nil Begin calls ss(true) just before
+// return. ss can be used to select slave device.
 func (spi *SPI) Begin(ss func(bool) error) error {
-	spi.bif = 0
+	if err := spi.drv.PurgeReadBuffer(); err != nil {
+		return err
+	}
+	spi.wbif = 0
 	if spi.cpha1 {
-		if _, err := spi.w.Write([]byte{spi.cidle}); err != nil {
+		if _, err := spi.drv.Write([]byte{spi.cidle}); err != nil {
 			return err
 		}
+		spi.rbif = -1 // Subsequent Read should skip first byte from driver.
+	} else {
+		spi.rbif = 0
 	}
 	if ss != nil {
 		return ss(true)
@@ -139,14 +147,18 @@ func (spi *SPI) Begin(ss func(bool) error) error {
 	return nil
 }
 
-// End should be called after end of conversation with slave device.
-// If ss!=nil End calls ss(false) just before return, to deselect slave device.
+// End should be called after end of conversation with slave device. In case of
+// CPHA1 it sets SCLK line to its idle state. After that it calls driver's Flush
+// method to ensure that all bits are really sent. If no errors and ss!=nil End
+// calls ss(false) just before return. ss can be used to deselect slave device.
 func (spi *SPI) End(ss func(bool) error) error {
-	spi.bif = 0
 	if !spi.cpha1 {
-		if _, err := spi.w.Write([]byte{spi.cidle}); err != nil {
+		if _, err := spi.drv.Write([]byte{spi.cidle}); err != nil {
 			return err
 		}
+	}
+	if err := spi.drv.Flush(); err != nil {
+		return err
 	}
 	if ss != nil {
 		return ss(true)
@@ -154,34 +166,34 @@ func (spi *SPI) End(ss func(bool) error) error {
 	return nil
 }
 
-// NewFrame resets internal byte counter. Use it to ensure that subsequent Write
-// starts new frame (not need if last frame has been completly written).
-// Additionaly it ensures that subsequent Write doesn't start with delay
-// sequence. Use it to avoid produce delay bits before new frame if they are not
-// needed this time.
-func (spi *SPI) NewFrame() {
-	spi.bif = 0
+//  NoDelay provides way to avoid produce delay bits before write new frame if
+// they are not needed this time.
+func (spi *SPI) NoDelay() {
+	spi.rbif = 0
+	spi.wbif = 0
 }
 
 // Write writes data to SPI bus. It divides data into frames and generates
-// delay bits if need.
+// delay bits if need. It uses driver's Write method with no more than 16 bytes
+// at once. Driver should implement buffering if such small chunks degrades
+// performance.
 func (spi *SPI) Write(data []byte) (int, error) {
-	var obuf [16]byte
+	var buf [16]byte
 	mask := uint(0x80)
 	if spi.lsbf {
 		mask = uint(0x01)
 	}
-	for n, b := range data {
+	for k, b := range data {
 		if spi.delay != 0 {
-			if spi.bif == spi.flen {
+			if spi.wbif == spi.flen {
 				for i := 0; i < spi.delay; i++ {
-					if _, err := spi.w.Write([]byte{spi.cidle, spi.cidle}); err != nil {
-						return n, err
+					if _, err := spi.drv.Write([]byte{spi.cidle, spi.cidle}); err != nil {
+						return k, err
 					}
 				}
-				spi.bif = 0
+				spi.wbif = 0
 			}
-			spi.bif++
+			spi.wbif++
 		}
 		u := uint(b)
 		for i := 0; i < 16; i += 2 {
@@ -189,17 +201,54 @@ func (spi *SPI) Write(data []byte) (int, error) {
 			if mask&u != 0 {
 				out = spi.cfirst | spi.mosi
 			}
-			obuf[i] = out
-			obuf[i+1] = out ^ spi.sclk
+			buf[i] = out
+			buf[i+1] = out ^ spi.sclk
 			if spi.lsbf {
 				u >>= 1
 			} else {
 				u <<= 1
 			}
 		}
-		if _, err := spi.w.Write(obuf[:]); err != nil {
-			return n, err
+		if _, err := spi.drv.Write(buf[:]); err != nil {
+			return k, err
 		}
 	}
 	return len(data), nil
+}
+
+// WriteN writes n zero bytes to SPI bus.
+func (spi *SPI) WriteN(n int) (int, error) {
+	var buf [16]byte
+	for k := 0; k < n; k++ {
+		if spi.delay != 0 {
+			if spi.wbif == spi.flen {
+				for i := 0; i < spi.delay; i++ {
+					if _, err := spi.drv.Write([]byte{spi.cidle, spi.cidle}); err != nil {
+						return k, err
+					}
+				}
+				spi.wbif = 0
+			}
+			spi.wbif++
+		}
+		for i := 0; i < 16; i += 2 {
+			out := spi.cfirst
+			buf[i] = out
+			buf[i+1] = out ^ spi.sclk
+		}
+		if _, err := spi.drv.Write(buf[:]); err != nil {
+			return k, err
+		}
+	}
+	return n, nil
+}
+
+func (spi *SPI) Read(data []byte) (int, error) {
+	var buf [16]byte
+	if spi.rbif != -1 {
+		
+	}
+	for k := range data {
+
+	}
 }
