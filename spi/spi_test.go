@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+type testdrv struct {
+	*bytes.Buffer
+}
+
+func (_ testdrv) PurgeReadBuffer() error { return nil }
+func (_ testdrv) Flush() error           { return nil }
+
 type wtest struct {
 	cfg Config
 	in  []byte
@@ -12,17 +19,20 @@ type wtest struct {
 }
 
 func (wt *wtest) check(t *testing.T) {
-	buf := bytes.NewBuffer(make([]byte, 0, len(wt.in)*16))
-	spi := New(nil, buf, 0x01, 0x10, 0)
-	spi.Configure(wt.cfg)
-	spi.Begin(nil)
-	spi.Write(wt.in)
-	spi.End(nil)
-	out := buf.Bytes()
+	drv := testdrv{bytes.NewBuffer(make([]byte, 0, len(wt.out)))}
+	ma := NewMaster(drv, 0x01, 0x10, 0)
+	ma.Configure(wt.cfg)
+	ma.Begin(nil)
+	ma.Write(wt.in)
+	ma.End(nil)
+	out := drv.Bytes()
 	if bytes.Equal(wt.out, out) {
 		return
 	}
-	t.Errorf("\n%+v\nin=%#v\ngood=%#v\nout =%#v\n\n", wt.cfg, wt.in, wt.out, out)
+	t.Errorf(
+		"\n%+v\nin=%#v\ngood=%#v\nout =%#v\n\n",
+		wt.cfg, wt.in, wt.out, out,
+	)
 }
 
 var wts = []wtest{
@@ -155,5 +165,82 @@ var wts = []wtest{
 func TestWrite(t *testing.T) {
 	for _, wt := range wts {
 		wt.check(t)
+	}
+}
+
+type wntest struct {
+	cfg Config
+	b   byte
+	n   int
+	out []byte
+}
+
+func (wnt *wntest) check(t *testing.T) {
+	drv := testdrv{bytes.NewBuffer(make([]byte, 0, len(wnt.out)))}
+	ma := NewMaster(drv, 0x01, 0x10, 0)
+	ma.Configure(wnt.cfg)
+	ma.Begin(nil)
+	ma.WriteN(wnt.b, wnt.n)
+	ma.End(nil)
+	out := drv.Bytes()
+	if bytes.Equal(wnt.out, out) {
+		return
+	}
+	t.Errorf(
+		"\n%+v\nb=%x n=%d\ngood=%#v\nout =%#v\n\n",
+		wnt.cfg, wnt.b, wnt.n, wnt.out, out,
+	)
+}
+
+var wnts = []wntest{
+	{
+		cfg: Config{MSBF | CPOL0 | CPHA0, 1, 0},
+		b:   0x55,
+		n:   2,
+		out: []byte{
+			0x00, 0x01, 0x10, 0x11, 0x00, 0x01, 0x10, 0x11,
+			0x00, 0x01, 0x10, 0x11, 0x00, 0x01, 0x10, 0x11,
+
+			0x00, 0x01, 0x10, 0x11, 0x00, 0x01, 0x10, 0x11,
+			0x00, 0x01, 0x10, 0x11, 0x00, 0x01, 0x10, 0x11,
+
+			0x00,
+		},
+	},
+	{
+		cfg: Config{MSBF | CPOL0 | CPHA0, 1, 0},
+		b:   0xaa,
+		n:   2,
+		out: []byte{
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+
+			0x00,
+		},
+	},
+	{
+		cfg: Config{MSBF | CPOL0 | CPHA0, 1, 1},
+		b:   0xaa,
+		n:   2,
+		out: []byte{
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+
+			0x00, 0x00,
+
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+			0x10, 0x11, 0x00, 0x01, 0x10, 0x11, 0x00, 0x01,
+
+			0x00,
+		},
+	},
+}
+
+func TestWriteN(t *testing.T) {
+	for _, wnt := range wnts {
+		wnt.check(t)
 	}
 }

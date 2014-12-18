@@ -9,6 +9,10 @@ type Debug struct {
 	w io.Writer
 }
 
+func (_ Debug) Read(_ []byte) (int, error) { return 0, nil }
+func (_ Debug) PurgeReadBuffer() error     { return nil }
+func (_ Debug) Flush() error               { return nil }
+
 func NewDebug(w io.Writer) Debug {
 	return Debug{w: w}
 }

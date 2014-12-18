@@ -1,8 +1,11 @@
-// Package SPI implements SPI protocol (http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus)
+// Package spi implements SPI protocol (http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus)
 // using bit banging (http://en.wikipedia.org/wiki/Bit_banging).
 package spi
 
 import (
+	"errors"
+	"io"
+
 	"github.com/ziutek/bitbang"
 )
 
@@ -50,8 +53,8 @@ type Config struct {
 	Delay    int // Delay between frames (delayTime = Delay*clockPeriod).
 }
 
-// SPI implements Serial Peripheral Interface protocol on master side.
-type SPI struct {
+// Master implements Serial Peripheral Interface protocol on master side.
+type Master struct {
 	drv  bitbang.SyncDriver
 	rbif int
 	wbif int
@@ -75,71 +78,71 @@ type SPI struct {
 // New panics if sclk&mosi != 0. Default configuration is: MSBF, CPOL0,
 // CPHA0, 8bit, no delay.
 // TODO: Write about sampling rate.
-func New(drv bitbang.SyncDriver, sclk, mosi, miso byte) *SPI {
-	spi := new(SPI)
-	spi.Init(drv, sclk, mosi, miso)
-	return spi
+func NewMaster(drv bitbang.SyncDriver, sclk, mosi, miso byte) *Master {
+	ma := new(Master)
+	ma.Init(drv, sclk, mosi, miso)
+	return ma
 }
 
 // Init works like New but initializes existing SPI variable.
-func (spi *SPI) Init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
+func (ma *Master) Init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
 	if sclk&mosi != 0 {
 		panic("SPI.Init: scln&mosi != 0")
 	}
-	spi.drv = drv
-	spi.rbif = 0
-	spi.wbif = 0
-	spi.sclk = sclk
-	spi.mosi = mosi
-	spi.miso = miso
+	ma.drv = drv
+	ma.rbif = 0
+	ma.wbif = 0
+	ma.sclk = sclk
+	ma.mosi = mosi
+	ma.miso = miso
 }
 
 // Configure configures SPI master. It can be used before start conversation to
 // slave device.
-func (spi *SPI) Configure(cfg Config) {
-	spi.cpha1 = (cfg.Mode&CPHA1 != 0)
+func (ma *Master) Configure(cfg Config) {
+	ma.cpha1 = (cfg.Mode&CPHA1 != 0)
 	if cfg.Mode&CPOL1 == 0 {
-		spi.cidle = 0
-		if spi.cpha1 {
-			spi.cfirst = spi.sclk
+		ma.cidle = 0
+		if ma.cpha1 {
+			ma.cfirst = ma.sclk
 		} else {
-			spi.cfirst = 0
+			ma.cfirst = 0
 		}
 	} else {
-		spi.cidle = spi.sclk
-		if spi.cpha1 {
-			spi.cfirst = 0
+		ma.cidle = ma.sclk
+		if ma.cpha1 {
+			ma.cfirst = 0
 		} else {
-			spi.cfirst = spi.sclk
+			ma.cfirst = ma.sclk
 		}
 	}
-	spi.lsbf = (cfg.Mode&LSBF != 0)
+	ma.lsbf = (cfg.Mode&LSBF != 0)
 	if cfg.Delay < 0 {
 		panic("SPI.Configure: delay < 0")
 	}
 	if cfg.Delay != 0 && cfg.FrameLen <= 0 {
 		panic("SPI.Configure: delay != 0 && flen <= 0")
 	}
-	spi.flen = cfg.FrameLen
-	spi.delay = cfg.Delay
+	ma.flen = cfg.FrameLen
+	ma.delay = cfg.Delay
 }
 
 // Begin should be called before starting conversation with slave device. It
 // calls drivers PurgeReadBuffer method and in case of CPHA1 it sets SCLK line
-// to its idle state.  If no erros and ss!=nil Begin calls ss(true) just before
-// return. ss can be used to select slave device.
-func (spi *SPI) Begin(ss func(bool) error) error {
-	if err := spi.drv.PurgeReadBuffer(); err != nil {
+// to its idle state. If no erros and ss!=nil Begin calls ss(true) just before
+// return.
+func (ma *Master) Begin(ss func(bool) error) error {
+	if err := ma.drv.PurgeReadBuffer(); err != nil {
 		return err
 	}
-	spi.wbif = 0
-	if spi.cpha1 {
-		if _, err := spi.drv.Write([]byte{spi.cidle}); err != nil {
+	ma.wbif = 0
+	if ma.cpha1 {
+		if _, err := ma.drv.Write([]byte{ma.cidle}); err != nil {
 			return err
 		}
-		spi.rbif = -1 // Subsequent Read should skip first byte from driver.
+		ma.rbif = -1 // Subsequent Read should skip first byte from driver.
 	} else {
-		spi.rbif = 0
+		ma.rbif = 0
 	}
 	if ss != nil {
 		return ss(true)
@@ -148,16 +151,16 @@ func (spi *SPI) Begin(ss func(bool) error) error {
 }
 
 // End should be called after end of conversation with slave device. In case of
-// CPHA1 it sets SCLK line to its idle state. After that it calls driver's Flush
-// method to ensure that all bits are really sent. If no errors and ss!=nil End
-// calls ss(false) just before return. ss can be used to deselect slave device.
-func (spi *SPI) End(ss func(bool) error) error {
-	if !spi.cpha1 {
-		if _, err := spi.drv.Write([]byte{spi.cidle}); err != nil {
+// CPHA1 it sets SCLK line to its idle state. After that it calls driver's
+// Flush method to ensure that all bits are really sent. If no errors and
+// ss!=nil End calls ss(false) just before return.
+func (ma *Master) End(ss func(bool) error) error {
+	if !ma.cpha1 {
+		if _, err := ma.drv.Write([]byte{ma.cidle}); err != nil {
 			return err
 		}
 	}
-	if err := spi.drv.Flush(); err != nil {
+	if err := ma.drv.Flush(); err != nil {
 		return err
 	}
 	if ss != nil {
@@ -166,89 +169,146 @@ func (spi *SPI) End(ss func(bool) error) error {
 	return nil
 }
 
-//  NoDelay provides way to avoid produce delay bits before write new frame if
-// they are not needed this time.
-func (spi *SPI) NoDelay() {
-	spi.rbif = 0
-	spi.wbif = 0
+// NoDelay can be used between frames to avoid produce delay bits (sometimes
+// usefull if Config.Delay > 0). If used in middle of frame it desynchronizes
+// stream of frames (subsequent delays will be inserted in wrong places).
+func (ma *Master) NoDelay() {
+	ma.rbif = 0
+	ma.wbif = 0
 }
 
-// Write writes data to SPI bus. It divides data into frames and generates
-// delay bits if need. It uses driver's Write method with no more than 16 bytes
-// at once. Driver should implement buffering if such small chunks degrades
-// performance.
-func (spi *SPI) Write(data []byte) (int, error) {
+// Write writes data to SPI bus. It divides data into frames and can generate
+// delay bits between them. It uses driver's Write method with no more than 16
+// bytes at once. Driver should implement buffering if such small chunks
+// degrades performance.
+func (ma *Master) Write(data []byte) (int, error) {
 	var buf [16]byte
 	mask := uint(0x80)
-	if spi.lsbf {
+	if ma.lsbf {
 		mask = uint(0x01)
 	}
 	for k, b := range data {
-		if spi.delay != 0 {
-			if spi.wbif == spi.flen {
-				for i := 0; i < spi.delay; i++ {
-					if _, err := spi.drv.Write([]byte{spi.cidle, spi.cidle}); err != nil {
+		if ma.delay != 0 {
+			if ma.wbif == ma.flen {
+				idle := []byte{ma.cidle, ma.cidle}
+				for i := 0; i < ma.delay; i++ {
+					if _, err := ma.drv.Write(idle); err != nil {
 						return k, err
 					}
 				}
-				spi.wbif = 0
+				ma.wbif = 0
 			}
-			spi.wbif++
+			ma.wbif++
 		}
 		u := uint(b)
-		for i := 0; i < 16; i += 2 {
-			out := spi.cfirst
+		for i := 0; i < len(buf); i += 2 {
+			out := ma.cfirst
 			if mask&u != 0 {
-				out = spi.cfirst | spi.mosi
+				out |= ma.mosi
 			}
 			buf[i] = out
-			buf[i+1] = out ^ spi.sclk
-			if spi.lsbf {
+			buf[i+1] = out ^ ma.sclk
+			if ma.lsbf {
 				u >>= 1
 			} else {
 				u <<= 1
 			}
 		}
-		if _, err := spi.drv.Write(buf[:]); err != nil {
+		if _, err := ma.drv.Write(buf[:]); err != nil {
 			return k, err
 		}
 	}
 	return len(data), nil
 }
 
-// WriteN writes n zero bytes to SPI bus.
-func (spi *SPI) WriteN(n int) (int, error) {
+// WriteN writes b n times to SPI bus. See Write for more info.
+func (ma *Master) WriteN(b byte, n int) (int, error) {
 	var buf [16]byte
+	mask := uint(0x80)
+	if ma.lsbf {
+		mask = uint(0x01)
+	}
+	u := uint(b)
+	for i := 0; i < len(buf); i += 2 {
+		out := ma.cfirst
+		if mask&u != 0 {
+			out |= ma.mosi
+		}
+		buf[i] = out
+		buf[i+1] = out ^ ma.sclk
+		if ma.lsbf {
+			u >>= 1
+		} else {
+			u <<= 1
+		}
+	}
 	for k := 0; k < n; k++ {
-		if spi.delay != 0 {
-			if spi.wbif == spi.flen {
-				for i := 0; i < spi.delay; i++ {
-					if _, err := spi.drv.Write([]byte{spi.cidle, spi.cidle}); err != nil {
+		if ma.delay != 0 {
+			if ma.wbif == ma.flen {
+				idle := []byte{ma.cidle, ma.cidle}
+				for i := 0; i < ma.delay; i++ {
+					if _, err := ma.drv.Write(idle); err != nil {
 						return k, err
 					}
 				}
-				spi.wbif = 0
+				ma.wbif = 0
 			}
-			spi.wbif++
+			ma.wbif++
 		}
-		for i := 0; i < 16; i += 2 {
-			out := spi.cfirst
-			buf[i] = out
-			buf[i+1] = out ^ spi.sclk
-		}
-		if _, err := spi.drv.Write(buf[:]); err != nil {
+		if _, err := ma.drv.Write(buf[:]); err != nil {
 			return k, err
 		}
 	}
 	return n, nil
 }
 
-func (spi *SPI) Read(data []byte) (int, error) {
+var ErrPhaseNoise = errors.New("noise or phase error")
+
+func (ma *Master) Read(data []byte) (int, error) {
+	if err := ma.drv.Flush(); err != nil {
+		return 0, err
+	}
 	var buf [16]byte
-	if spi.rbif != -1 {
-		
+	if ma.rbif != -1 {
+		if n, err := ma.drv.Read(buf[:1]); n == 0 {
+			if err == nil || err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
+		ma.rbif = 0
 	}
 	for k := range data {
-
+		if ma.delay != 0 {
+			if ma.rbif == ma.flen {
+				for i := 0; i < ma.delay; i++ {
+					if _, err := ma.drv.Read(buf[:2]); err != nil {
+						return k, err
+					}
+				}
+				ma.rbif = 0
+			}
+			ma.rbif++
+		}
+		if n, err := io.ReadFull(ma.drv, buf[:]); n < len(buf) {
+			if err == io.EOF {
+				err = nil
+			}
+			return k, err
+		}
+		var u uint
+		for i := 0; i < len(buf); i += 2 {
+			bit := buf[i]
+			if bit != buf[i+1] {
+				return k, ErrPhaseNoise
+			}
+			if ma.lsbf {
+				u = u>>1 | 0x80
+			} else {
+				u = u<<1 | 0x01
+			}
+		}
+		data[k] = byte(u)
 	}
+	return len(data), nil
 }

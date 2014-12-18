@@ -18,7 +18,7 @@ func checkErr(err error) {
 
 func main() {
 	d := bitbang.NewDebug(os.Stdout)
-	s := spi.New(nil, d, 0x01, 0x10, 0)
+	s := spi.NewMaster(d, 0x01, 0x10, 0)
 	n, err := s.Write([]byte{0x55, 0xaa})
 	fmt.Println("--")
 	fmt.Println(n, "bytes written")
