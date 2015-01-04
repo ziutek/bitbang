@@ -56,7 +56,7 @@ type Config struct {
 // Master implements Serial Peripheral Interface protocol on master side.
 type Master struct {
 	drv  bitbang.SyncDriver
-	tord chan int
+	tord chan int8
 	werr error
 	wmtx sync.Mutex
 	fn   int
@@ -95,7 +95,7 @@ func (ma *Master) init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
 	}
 	*ma = Master{
 		drv:  drv,
-		tord: make(chan int, 16),
+		tord: make(chan int8, 4096/16), // Good value for 4 KiB write buf.
 		sclk: sclk,
 		mosi: mosi,
 		miso: miso,
@@ -147,25 +147,38 @@ func (ma *Master) werror(err error) {
 	close(ma.tord)
 }
 
+// toread informs read about data to read
+func (ma *Master) tordFlush(n int) error {
+	if len(ma.tord) == cap(ma.tord) {
+		// Read reads to slow. Probably drv write buffer is too big or
+		// cap(ma.tord) too litle.
+		if err := ma.drv.Flush(); err != nil {
+			return err
+		}
+	}
+	if n > 127 || n < -128 {
+		panic("n>127 || n<-128")
+	}
+	ma.tord <- int8(n)
+	return nil
+}
+
 // Begin should be called before starting conversation with slave device.
 // In case of CPHA1 it sets SCLK line to its idle state.
 func (ma *Master) Begin() error {
 	ma.wmtx.Lock()
 	ma.flen = -ma.flen
 	ma.fn = 0
-	var (
-		m, n int
-		err  error
-	)
-	if len(ma.pre) > 0 {
-		n, err = ma.drv.Write(ma.pre)
+	n := len(ma.pre)
+	if ma.cpha1 {
+		n++
+	}
+	err := ma.tordFlush(-n)
+	if len(ma.pre) > 0 && err == nil {
+		_, err = ma.drv.Write(ma.pre)
 	}
 	if ma.cpha1 && err == nil {
-		m, err = ma.drv.Write([]byte{ma.cidle})
-		n += m
-	}
-	if n != 0 {
-		ma.tord <- -n
+		_, err = ma.drv.Write([]byte{ma.base | ma.cidle})
 	}
 	if err != nil {
 		ma.werror(err)
@@ -179,19 +192,16 @@ func (ma *Master) Begin() error {
 // Flush method to ensure that all bits are really sent.
 func (ma *Master) End() error {
 	ma.flen = -ma.flen
-	var (
-		m, n int
-		err  error
-	)
+	n := len(ma.post)
 	if !ma.cpha1 {
-		n, err = ma.drv.Write([]byte{ma.cidle})
+		n++
+	}
+	err := ma.tordFlush(-n)
+	if !ma.cpha1 && err == nil {
+		_, err = ma.drv.Write([]byte{ma.base | ma.cidle})
 	}
 	if len(ma.post) > 0 && err == nil {
-		m, err = ma.drv.Write(ma.post)
-		n += m
-	}
-	if n != 0 {
-		ma.tord <- -n
+		_, err = ma.drv.Write(ma.post)
 	}
 	if err == nil {
 		err = ma.drv.Flush()
@@ -208,6 +218,47 @@ func (ma *Master) End() error {
 // stream of frames (subsequent delays will be inserted in wrong places).
 func (ma *Master) NoDelay() {
 	ma.fn = 0
+}
+
+func (ma *Master) writeByte(b byte, mask uint, buf *[16]byte) error {
+	if ma.delay > 0 {
+		if ma.fn == ma.flen {
+			idle := ma.base | ma.cidle
+			ibuf := []byte{idle, idle}
+			err := ma.tordFlush(-ma.delay * len(ibuf))
+			for i := 0; i < ma.delay && err == nil; i++ {
+				_, err = ma.drv.Write(ibuf)
+			}
+			if err != nil {
+				ma.werror(err)
+				return err
+			}
+			ma.fn = 0
+		}
+		ma.fn++
+	}
+	u := uint(b)
+	for i := 0; i < len(*buf); i += 2 {
+		out := ma.base | ma.cfirst
+		if mask&u != 0 {
+			out |= ma.mosi
+		}
+		buf[i] = out
+		buf[i+1] = out ^ ma.sclk
+		if ma.lsbf {
+			u >>= 1
+		} else {
+			u <<= 1
+		}
+	}
+	err := ma.tordFlush(len(buf))
+	if err == nil {
+		_, err = ma.drv.Write(buf[:])
+	}
+	if err != nil {
+		ma.werror(err)
+	}
+	return err
 }
 
 // Write writes data to SPI bus. It divides data into frames and generates
@@ -227,54 +278,42 @@ func (ma *Master) Write(data []byte) (int, error) {
 		mask = uint(0x01)
 	}
 	for k, b := range data {
-		if ma.delay > 0 {
-			if ma.fn == ma.flen {
-				idle := ma.base | ma.cidle
-				ibuf := []byte{idle, idle}
-				var (
-					n, m int
-					err  error
-				)
-				for i := 0; i < ma.delay && err == nil; i++ {
-					m, err = ma.drv.Write(ibuf)
-					n -= m
-
-				}
-				if n != 0 {
-					ma.tord <- n
-				}
-				if err != nil {
-					ma.werror(err)
-					return k, err
-				}
-				ma.fn = 0
-			}
-			ma.fn++
-		}
-		u := uint(b)
-		for i := 0; i < len(buf); i += 2 {
-			out := ma.base | ma.cfirst
-			if mask&u != 0 {
-				out |= ma.mosi
-			}
-			buf[i] = out
-			buf[i+1] = out ^ ma.sclk
-			if ma.lsbf {
-				u >>= 1
-			} else {
-				u <<= 1
-			}
-		}
-		n, err := ma.drv.Write(buf[:])
-		if n != 0 {
-			ma.tord <- n
-		}
-		if err != nil {
-			ma.werror(err)
+		if err := ma.writeByte(b, mask, &buf); err != nil {
 			return k, err
 		}
 	}
 	return len(data), nil
+}
+
+// WriteString works like Write but writes bytes from string.
+func (ma *Master) WriteString(s string) (int, error) {
+	if ma.flen < 0 {
+		panic("WriteString outside Begin:End block")
+	}
+	var buf [16]byte
+	mask := uint(0x80)
+	if ma.lsbf {
+		mask = uint(0x01)
+	}
+	for k := 0; k < len(s); k++ {
+		if err := ma.writeByte(s[k], mask, &buf); err != nil {
+			return k, err
+		}
+	}
+	return len(s), nil
+}
+
+// WriteByte works like Write but writes only one byte.
+func (ma *Master) WriteByte(b byte) error {
+	if ma.flen < 0 {
+		panic("WriteByte outside Begin:End block")
+	}
+	var buf [16]byte
+	mask := uint(0x80)
+	if ma.lsbf {
+		mask = uint(0x01)
+	}
+	return ma.writeByte(b, mask, &buf)
 }
 
 // WriteN writes b n times to SPI bus. See Write for more info.
@@ -306,16 +345,9 @@ func (ma *Master) WriteN(b byte, n int) (int, error) {
 			if ma.fn == ma.flen {
 				idle := ma.base | ma.cidle
 				ibuf := []byte{idle, idle}
-				var (
-					m, n int
-					err  error
-				)
+				err := ma.tordFlush(-ma.delay * len(ibuf))
 				for i := 0; i < ma.delay && err == nil; i++ {
-					m, err = ma.drv.Write(ibuf)
-					n -= m
-				}
-				if n != 0 {
-					ma.tord <- n
+					_, err = ma.drv.Write(ibuf)
 				}
 				if err != nil {
 					ma.werror(err)
@@ -325,9 +357,9 @@ func (ma *Master) WriteN(b byte, n int) (int, error) {
 			}
 			ma.fn++
 		}
-		n, err := ma.drv.Write(buf[:])
-		if n != 0 {
-			ma.tord <- n
+		err := ma.tordFlush(len(buf))
+		if err == nil {
+			_, err = ma.drv.Write(buf[:])
 		}
 		if err != nil {
 			ma.werror(err)
@@ -351,7 +383,7 @@ func (ma *Master) Flush() error {
 func (ma *Master) Read(data []byte) (int, error) {
 	var buf [16]byte
 	for k := range data {
-		var m int
+		var m int8
 		for {
 			var ok bool
 			m, ok = <-ma.tord
@@ -398,7 +430,7 @@ func (ma *Master) Read(data []byte) (int, error) {
 func (ma *Master) ReadN(n int) (int, error) {
 	var buf [16]byte
 	for k := 0; k < n; k++ {
-		var m int
+		var m int8
 		for {
 			var ok bool
 			m, ok = <-ma.tord

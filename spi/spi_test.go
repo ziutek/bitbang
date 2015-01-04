@@ -184,6 +184,16 @@ var wts = []wtest{
 			0x80,
 		},
 	},
+	{
+		cfg: Config{MSBF | CPOL0 | CPHA0, 1, 0},
+		in:  nil,
+		out: []byte{
+			0x80,
+
+			0x00,
+			0x80,
+		},
+	},	
 }
 
 func TestWrite(t *testing.T) {
