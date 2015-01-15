@@ -57,6 +57,7 @@ type Config struct {
 type Master struct {
 	drv  bitbang.SyncDriver
 	tord chan int8
+	dr   bool
 	werr error
 	wmtx sync.Mutex
 	fn   int
@@ -73,7 +74,7 @@ type Master struct {
 	cpha1  bool
 	lsbf   bool
 	flen   int
-	delay  int
+	dlyn   int
 }
 
 // New returns new SPI that uses r/w to read/write data using SPI protocol.
@@ -84,15 +85,10 @@ type Master struct {
 // CPHA0, 8bit, no delay.
 // TODO: Write about sampling rate.
 func NewMaster(drv bitbang.SyncDriver, sclk, mosi, miso byte) *Master {
-	ma := new(Master)
-	ma.init(drv, sclk, mosi, miso)
-	return ma
-}
-
-func (ma *Master) init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
 	if sclk&mosi != 0 {
-		panic("spi.Master.init: scln&mosi != 0")
+		panic("scln&mosi!=0")
 	}
+	ma := new(Master)
 	*ma = Master{
 		drv:  drv,
 		tord: make(chan int8, 4096/16), // Good value for 4 KiB write buf.
@@ -100,18 +96,33 @@ func (ma *Master) init(drv bitbang.SyncDriver, sclk, mosi, miso byte) {
 		mosi: mosi,
 		miso: miso,
 	}
+	return ma
 }
 
 func (ma *Master) SetPrePost(pre, post []byte) {
+	if len(pre) > 16 {
+		panic("len(pre)>16")
+	}
+	if len(post) > 16 {
+		panic("len(post)>16")
+	}
 	ma.pre = pre
 	ma.post = post
+}
+
+func (ma *Master) PrePost() (pre, post []byte) {
+	return ma.pre, ma.post
 }
 
 func (ma *Master) SetBase(base byte) {
 	ma.base = base
 }
 
-// Configure configures SPI master. It can be used before start conversation to
+func (ma *Master) Base() byte {
+	return ma.base
+}
+
+// Configure configures SPI master. It can be used before start transaction to
 // slave device.
 func (ma *Master) Configure(cfg Config) {
 	ma.cpha1 = (cfg.Mode&CPHA1 != 0)
@@ -132,13 +143,13 @@ func (ma *Master) Configure(cfg Config) {
 	}
 	ma.lsbf = (cfg.Mode&LSBF != 0)
 	if cfg.Delay < 0 || cfg.Delay > 8 {
-		panic("Delay < 0 || cfg.Delay > 8")
+		panic("Delay<0 || cfg.Delay>8")
 	}
 	if cfg.FrameLen <= 0 {
 		panic("FrameLen <= 0")
 	}
 	ma.flen = -cfg.FrameLen
-	ma.delay = cfg.Delay
+	ma.dlyn = cfg.Delay
 }
 
 // werror informs Read about Write error.
@@ -148,7 +159,7 @@ func (ma *Master) werror(err error) {
 }
 
 // toread informs read about data to read
-func (ma *Master) tordFlush(n int) error {
+func (ma *Master) toread(n int) error {
 	if len(ma.tord) == cap(ma.tord) {
 		// Read reads to slow. Probably drv write buffer is too big or
 		// cap(ma.tord) too litle.
@@ -163,7 +174,7 @@ func (ma *Master) tordFlush(n int) error {
 	return nil
 }
 
-// Begin should be called before starting conversation with slave device.
+// Begin should be called before starting transaction with slave device.
 // In case of CPHA1 it sets SCLK line to its idle state.
 func (ma *Master) Begin() error {
 	ma.wmtx.Lock()
@@ -173,7 +184,7 @@ func (ma *Master) Begin() error {
 	if ma.cpha1 {
 		n++
 	}
-	err := ma.tordFlush(-n)
+	err := ma.toread(-n)
 	if len(ma.pre) > 0 && err == nil {
 		_, err = ma.drv.Write(ma.pre)
 	}
@@ -187,7 +198,19 @@ func (ma *Master) Begin() error {
 	return err
 }
 
-// End should be called after end of conversation with slave device. In case of
+// Flush calls Driver.Flush.
+func (ma *Master) Flush() error {
+	err := ma.toread(0)
+	if err == nil {
+		err = ma.drv.Flush()
+	}
+	if err != nil {
+		ma.werror(err)
+	}
+	return err
+}
+
+// End should be called after end of transaction with slave device. In case of
 // CPHA1 it sets SCLK line to its idle state. After that it calls driver's
 // Flush method to ensure that all bits are really sent.
 func (ma *Master) End() error {
@@ -196,7 +219,7 @@ func (ma *Master) End() error {
 	if !ma.cpha1 {
 		n++
 	}
-	err := ma.tordFlush(-n)
+	err := ma.toread(-n)
 	if !ma.cpha1 && err == nil {
 		_, err = ma.drv.Write([]byte{ma.base | ma.cidle})
 	}
@@ -204,10 +227,7 @@ func (ma *Master) End() error {
 		_, err = ma.drv.Write(ma.post)
 	}
 	if err == nil {
-		err = ma.drv.Flush()
-	}
-	if err != nil {
-		ma.werror(err)
+		err = ma.Flush()
 	}
 	ma.wmtx.Unlock()
 	return err
@@ -220,44 +240,48 @@ func (ma *Master) NoDelay() {
 	ma.fn = 0
 }
 
-func (ma *Master) writeByte(b byte, mask uint, buf *[16]byte) error {
-	if ma.delay > 0 {
-		if ma.fn == ma.flen {
-			idle := ma.base | ma.cidle
-			ibuf := []byte{idle, idle}
-			err := ma.tordFlush(-ma.delay * len(ibuf))
-			for i := 0; i < ma.delay && err == nil; i++ {
-				_, err = ma.drv.Write(ibuf)
-			}
-			if err != nil {
-				ma.werror(err)
-				return err
-			}
-			ma.fn = 0
-		}
-		ma.fn++
-	}
+func (ma *Master) tobits(bits *[16]byte, b byte) {
 	u := uint(b)
-	for i := 0; i < len(*buf); i += 2 {
-		out := ma.base | ma.cfirst
+	mask := uint(0x80)
+	if ma.lsbf {
+		mask = 0x01
+	}
+	for i := 0; i < len(bits); i += 2 {
+		bit := ma.base | ma.cfirst
 		if mask&u != 0 {
-			out |= ma.mosi
+			bit |= ma.mosi
 		}
-		buf[i] = out
-		buf[i+1] = out ^ ma.sclk
+		bits[i] = bit
+		bits[i+1] = bit ^ ma.sclk
 		if ma.lsbf {
 			u >>= 1
 		} else {
 			u <<= 1
 		}
 	}
-	err := ma.tordFlush(len(buf))
-	if err == nil {
-		_, err = ma.drv.Write(buf[:])
+}
+
+func (ma *Master) writeBits(bits *[16]byte) error {
+	if ma.dlyn > 0 {
+		if ma.fn == ma.flen {
+			idle := ma.base | ma.cidle
+			ibuf := []byte{idle, idle}
+			if err := ma.toread(-ma.dlyn * len(ibuf)); err != nil {
+				return err
+			}
+			for i := 0; i < ma.dlyn; i++ {
+				if _, err := ma.drv.Write(ibuf); err != nil {
+					return err
+				}
+			}
+			ma.fn = 0
+		}
+		ma.fn++
 	}
-	if err != nil {
-		ma.werror(err)
+	if err := ma.toread(len(bits)); err != nil {
+		return err
 	}
+	_, err := ma.drv.Write(bits[:])
 	return err
 }
 
@@ -272,48 +296,31 @@ func (ma *Master) Write(data []byte) (int, error) {
 	if ma.flen < 0 {
 		panic("Write outside Begin:End block")
 	}
-	var buf [16]byte
-	mask := uint(0x80)
-	if ma.lsbf {
-		mask = uint(0x01)
-	}
+	var bits [16]byte
 	for k, b := range data {
-		if err := ma.writeByte(b, mask, &buf); err != nil {
+		ma.tobits(&bits, b)
+		if err := ma.writeBits(&bits); err != nil {
+			ma.werror(err)
 			return k, err
 		}
 	}
 	return len(data), nil
 }
 
-// WriteString works like Write but writes bytes from string.
+// WriteString works like Write..
 func (ma *Master) WriteString(s string) (int, error) {
 	if ma.flen < 0 {
 		panic("WriteString outside Begin:End block")
 	}
-	var buf [16]byte
-	mask := uint(0x80)
-	if ma.lsbf {
-		mask = uint(0x01)
-	}
+	var bits [16]byte
 	for k := 0; k < len(s); k++ {
-		if err := ma.writeByte(s[k], mask, &buf); err != nil {
+		ma.tobits(&bits, s[k])
+		if err := ma.writeBits(&bits); err != nil {
+			ma.werror(err)
 			return k, err
 		}
 	}
 	return len(s), nil
-}
-
-// WriteByte works like Write but writes only one byte.
-func (ma *Master) WriteByte(b byte) error {
-	if ma.flen < 0 {
-		panic("WriteByte outside Begin:End block")
-	}
-	var buf [16]byte
-	mask := uint(0x80)
-	if ma.lsbf {
-		mask = uint(0x01)
-	}
-	return ma.writeByte(b, mask, &buf)
 }
 
 // WriteN writes b n times to SPI bus. See Write for more info.
@@ -321,47 +328,10 @@ func (ma *Master) WriteN(b byte, n int) (int, error) {
 	if ma.flen < 0 {
 		panic("WriteN outside Begin:End block")
 	}
-	var buf [16]byte
-	mask := uint(0x80)
-	if ma.lsbf {
-		mask = uint(0x01)
-	}
-	u := uint(b)
-	for i := 0; i < len(buf); i += 2 {
-		out := ma.base | ma.cfirst
-		if mask&u != 0 {
-			out |= ma.mosi
-		}
-		buf[i] = out
-		buf[i+1] = out ^ ma.sclk
-		if ma.lsbf {
-			u >>= 1
-		} else {
-			u <<= 1
-		}
-	}
+	var bits [16]byte
+	ma.tobits(&bits, b)
 	for k := 0; k < n; k++ {
-		if ma.delay > 0 {
-			if ma.fn == ma.flen {
-				idle := ma.base | ma.cidle
-				ibuf := []byte{idle, idle}
-				err := ma.tordFlush(-ma.delay * len(ibuf))
-				for i := 0; i < ma.delay && err == nil; i++ {
-					_, err = ma.drv.Write(ibuf)
-				}
-				if err != nil {
-					ma.werror(err)
-					return k, err
-				}
-				ma.fn = 0
-			}
-			ma.fn++
-		}
-		err := ma.tordFlush(len(buf))
-		if err == nil {
-			_, err = ma.drv.Write(buf[:])
-		}
-		if err != nil {
+		if err := ma.writeBits(&bits); err != nil {
 			ma.werror(err)
 			return k, err
 		}
@@ -369,89 +339,104 @@ func (ma *Master) WriteN(b byte, n int) (int, error) {
 	return n, nil
 }
 
-// Flush wraps Driver.Flush method.
-func (ma *Master) Flush() error {
-	err := ma.drv.Flush()
-	if err != nil {
-		ma.werror(err)
+func (ma *Master) tobyte(bits *[16]byte) byte {
+	var u uint
+	if ma.lsbf {
+		for i := 1; i < len(bits); i += 2 {
+			u >>= 1
+			if bits[i]&ma.miso != 0 {
+				u |= 0x80
+			}
+		}
+	} else {
+		for i := 1; i < len(bits); i += 2 {
+			u <<= 1
+			if bits[i]&ma.miso != 0 {
+				u |= 0x01
+			}
+		}
 	}
+	return byte(u)
+}
+
+func (ma *Master) discard(bits *[16]byte, ignfmark bool) error {
+	if ma.dr {
+		return nil
+	}
+	for {
+		m, ok := <-ma.tord
+		if !ok {
+			return ma.werr
+		}
+		switch {
+		case int(m) == len(bits):
+			ma.dr = true
+			return nil
+		case m == 0:
+			if ignfmark {
+				continue
+			}
+			return nil
+		case m > 0:
+			panic("m>0 && m!=len(bits)")
+		}
+		if _, err := io.ReadFull(ma.drv, bits[:-m]); err != nil {
+			return err
+		}
+	}
+}
+
+func (ma *Master) readBits(bits *[16]byte) error {
+	n, err := io.ReadFull(ma.drv, bits[:])
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	} else if n != len(bits) {
+		err = io.ErrUnexpectedEOF
+	}
+	ma.dr = false
 	return err
 }
 
 // Read reads bytes from SPI bus into data. It always reads len(data) bytes or
-// returns error (like io.ReadFull).
-func (ma *Master) Read(data []byte) (int, error) {
-	var buf [16]byte
-	for k := range data {
-		var m int8
-		for {
-			var ok bool
-			m, ok = <-ma.tord
-			if !ok {
-				return k, ma.werr
-			}
-			if m > 0 {
-				break
-			}
-			if _, err := io.ReadFull(ma.drv, buf[:-m]); err != nil {
-				return k, err
-			}
-		}
-		if i, err := io.ReadFull(ma.drv, buf[:m]); err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
-			return k, err
-		} else if i != len(buf) {
-			return k, io.ErrUnexpectedEOF
-		}
-		var u uint
-		if ma.lsbf {
-			for i := 1; i < len(buf); i += 2 {
-				u >>= 1
-				if buf[i]&ma.miso != 0 {
-					u |= 0x80
-				}
-			}
-		} else {
-			for i := 1; i < len(buf); i += 2 {
-				u <<= 1
-				if buf[i]&ma.miso != 0 {
-					u |= 0x01
-				}
-			}
-		}
-		data[k] = byte(u)
+// returns error (like io.ReadFull). If len(data)==0 Read only discards overhead
+// bits up to the firs data bit or up the Flush mark.
+func (ma *Master) Read(data []byte) (m int, err error) {
+	var bits [16]byte
+	if len(data) == 0 {
+		err = ma.discard(&bits, false)
+		return
 	}
-	return len(data), nil
+	for m < len(data) {
+		if err = ma.discard(&bits, true); err != nil {
+			return
+		}
+		if err = ma.readBits(&bits); err != nil {
+			return
+		}
+		data[m] = ma.tobyte(&bits)
+		m++
+	}
+	return
 }
 
-// ReadN reads and discards n bytes from SPI bus.
-func (ma *Master) ReadN(n int) (int, error) {
-	var buf [16]byte
-	for k := 0; k < n; k++ {
-		var m int8
-		for {
-			var ok bool
-			m, ok = <-ma.tord
-			if !ok {
-				return k, ma.werr
-			}
-			if m >= 0 {
-				break
-			}
-			if _, err := io.ReadFull(ma.drv, buf[:-m]); err != nil {
-				return k, err
-			}
-		}
-		if i, err := io.ReadFull(ma.drv, buf[:m]); err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
-			return k, err
-		} else if i != len(buf) {
-			return k, io.ErrUnexpectedEOF
-		}
+// ReadN reads and discards n bytes from SPI bus. If n==0 ReadN only discards
+// overhead bits up to first data bit.
+func (ma *Master) ReadN(n int) (m int, err error) {
+	var bits [16]byte
+	if n == 0 {
+		err = ma.discard(&bits, false)
+		return
 	}
-	return n, nil
+	for m < n {
+		if err = ma.discard(&bits, true); err != nil {
+			return
+		}
+		if err = ma.readBits(&bits); err != nil {
+			return
+		}
+		m++
+	}
+	return
 }
