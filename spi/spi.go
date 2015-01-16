@@ -155,18 +155,13 @@ func (ma *Master) Configure(cfg Config) {
 // werror informs Read about Write error.
 func (ma *Master) werror(err error) {
 	ma.werr = err
-	if ma.tord != nil {
-		close(ma.tord)
-		ma.tord = nil
-	}
+	close(ma.tord)
+	ma.tord = nil
 	ma.wmtx.Unlock()
 }
 
 // toread informs read about data to read
 func (ma *Master) toread(n int) error {
-	if ma.werr != nil {
-		return ma.werr
-	}
 	if len(ma.tord) == cap(ma.tord) {
 		// Read reads to slow. Probably drv write buffer is too big or
 		// cap(ma.tord) too litle.
@@ -185,6 +180,10 @@ func (ma *Master) toread(n int) error {
 // In case of CPHA1 it sets SCLK line to its idle state.
 func (ma *Master) Begin() error {
 	ma.wmtx.Lock()
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return ma.werr
+	}
 	ma.flen = -ma.flen
 	ma.fn = 0
 	n := len(ma.pre)
@@ -207,6 +206,10 @@ func (ma *Master) Begin() error {
 
 // Flush calls Driver.Flush.
 func (ma *Master) Flush() error {
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return ma.werr
+	}
 	err := ma.toread(0)
 	if err == nil {
 		err = ma.drv.Flush()
@@ -221,6 +224,10 @@ func (ma *Master) Flush() error {
 // CPHA1 it sets SCLK line to its idle state. After that it calls driver's
 // Flush method to ensure that all bits are really sent.
 func (ma *Master) End() error {
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return ma.werr
+	}
 	ma.flen = -ma.flen
 	n := len(ma.post)
 	if !ma.cpha1 {
@@ -307,6 +314,10 @@ func (ma *Master) writeBits(bits *[16]byte) error {
 // limited size so the common idiom is to call Read and Write concurently
 // to avoid blocking.
 func (ma *Master) Write(data []byte) (int, error) {
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return 0, ma.werr
+	}
 	if ma.flen < 0 {
 		panic("Write outside Begin:End block")
 	}
@@ -323,6 +334,10 @@ func (ma *Master) Write(data []byte) (int, error) {
 
 // WriteString works like Write..
 func (ma *Master) WriteString(s string) (int, error) {
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return 0, ma.werr
+	}
 	if ma.flen < 0 {
 		panic("WriteString outside Begin:End block")
 	}
@@ -339,6 +354,10 @@ func (ma *Master) WriteString(s string) (int, error) {
 
 // WriteN writes b n times to SPI bus. See Write for more info.
 func (ma *Master) WriteN(b byte, n int) (int, error) {
+	if ma.werr != nil {
+		ma.wmtx.Unlock()
+		return 0, ma.werr
+	}
 	if ma.flen < 0 {
 		panic("WriteN outside Begin:End block")
 	}
