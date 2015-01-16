@@ -155,11 +155,18 @@ func (ma *Master) Configure(cfg Config) {
 // werror informs Read about Write error.
 func (ma *Master) werror(err error) {
 	ma.werr = err
-	close(ma.tord)
+	if ma.tord != nil {
+		close(ma.tord)
+		ma.tord = nil
+	}
+	ma.wmtx.Unlock()
 }
 
 // toread informs read about data to read
 func (ma *Master) toread(n int) error {
+	if ma.werr != nil {
+		return ma.werr
+	}
 	if len(ma.tord) == cap(ma.tord) {
 		// Read reads to slow. Probably drv write buffer is too big or
 		// cap(ma.tord) too litle.
@@ -193,9 +200,9 @@ func (ma *Master) Begin() error {
 	}
 	if err != nil {
 		ma.werror(err)
-		ma.wmtx.Unlock()
+		return err
 	}
-	return err
+	return nil
 }
 
 // Flush calls Driver.Flush.
@@ -227,10 +234,17 @@ func (ma *Master) End() error {
 		_, err = ma.drv.Write(ma.post)
 	}
 	if err == nil {
-		err = ma.Flush()
+		err = ma.toread(0)
+	}
+	if err == nil {
+		err = ma.drv.Flush()
+	}
+	if err != nil {
+		ma.werror(err)
+		return err
 	}
 	ma.wmtx.Unlock()
-	return err
+	return nil
 }
 
 // NoDelay can be used between frames to avoid produce delay bits (sometimes
